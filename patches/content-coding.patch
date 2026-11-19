@@ -1,0 +1,453 @@
+Share the zstd module's RFC 9110 parser across all three response codings.
+Evaluate repeated Accept-Encoding fields together without modifying upstream request headers.
+
+--- a/zstd/ngx_http_zstd_accept_encoding.h
++++ b/zstd/ngx_http_zstd_accept_encoding.h
+@@ -171,23 +171,21 @@
+ }
+ 
+ 
+-static ngx_inline ngx_int_t
+-ngx_http_zstd_accept_encoding(ngx_str_t *ae)
++static ngx_inline void
++ngx_http_coding_weights(ngx_str_t *ae, const char *coding, size_t coding_len,
++    ngx_int_t *explicit_q, ngx_int_t *wildcard_q)
+ {
+     u_char     *p, *last, *name, *param;
+     size_t      len, param_len;
+-    ngx_int_t   q, zstd_q, wildcard_q;
++    ngx_int_t   q;
+     ngx_uint_t  seen_q, bad;
+ 
+-    if (ae == NULL || ae->data == NULL) {
+-        return NGX_DECLINED;
++    if (ae->data == NULL || ae->len == 0) {
++        return;
+     }
+ 
+     p = ae->data;
+-    last = ae->data + ae->len;
+-
+-    zstd_q = NGX_HTTP_ZSTD_QVALUE_ABSENT;
+-    wildcard_q = NGX_HTTP_ZSTD_QVALUE_ABSENT;
++    last = p + ae->len;
+ 
+     while (p < last) {
+ 
+@@ -291,28 +289,36 @@
+         }
+ 
+         if (!bad) {
+-            if (len == 4 && ngx_strncasecmp(name, (u_char *) "zstd", 4) == 0) {
+-                zstd_q = q;
++            if (len == coding_len
++                && ngx_strncasecmp(name, (u_char *) coding, len) == 0)
++            {
++                *explicit_q = q;
+ 
+             } else if (len == 1 && *name == '*') {
+-                wildcard_q = q;
++                *wildcard_q = q;
+             }
+         }
+ 
+         p = ngx_http_zstd_skip_element(p, last);
+     }
+-
+-    /* an explicit entry for the coding always beats the wildcard */
+-
+-    if (zstd_q != NGX_HTTP_ZSTD_QVALUE_ABSENT) {
+-        return zstd_q > 0 ? NGX_OK : NGX_DECLINED;
+-    }
+-
+-    if (wildcard_q != NGX_HTTP_ZSTD_QVALUE_ABSENT) {
+-        return wildcard_q > 0 ? NGX_OK : NGX_DECLINED;
+-    }
+-
+-    return NGX_DECLINED;
++}
++
++
++static ngx_inline ngx_int_t
++ngx_http_accepts_coding(ngx_table_elt_t *header, const char *coding, size_t len)
++{
++    ngx_int_t  q = NGX_HTTP_ZSTD_QVALUE_ABSENT;
++    ngx_int_t  wildcard = NGX_HTTP_ZSTD_QVALUE_ABSENT;
++
++    for ( ; header; header = header->next) {
++        ngx_http_coding_weights(&header->value, coding, len, &q, &wildcard);
++    }
++
++    if (q == NGX_HTTP_ZSTD_QVALUE_ABSENT) {
++        q = wildcard;
++    }
++
++    return q > 0 ? NGX_OK : NGX_DECLINED;
+ }
+ 
+ 
+--- a/zstd/filter/ngx_http_zstd_filter.c
++++ b/zstd/filter/ngx_http_zstd_filter.c
+@@ -556,18 +556,12 @@
+ static ngx_int_t
+ ngx_http_zstd_ok(ngx_http_request_t *r)
+ {
+-    ngx_table_elt_t  *ae;
+-
+     if (r != r->main) {
+         return NGX_DECLINED;
+     }
+ 
+-    ae = r->headers_in.accept_encoding;
+-    if (ae == NULL) {
+-        return NGX_DECLINED;
+-    }
+-
+-    return ngx_http_zstd_accept_encoding(&ae->value);
++    return ngx_http_accepts_coding(r->headers_in.accept_encoding, "zstd",
++                                   sizeof("zstd") - 1);
+ }
+ 
+ 
+--- a/zstd/static/ngx_http_zstd_static_module.c
++++ b/zstd/static/ngx_http_zstd_static_module.c
+@@ -293,18 +293,12 @@
+ static ngx_int_t
+ ngx_http_zstd_ok(ngx_http_request_t *r)
+ {
+-    ngx_table_elt_t  *ae;
+-
+     if (r != r->main) {
+         return NGX_DECLINED;
+     }
+ 
+-    ae = r->headers_in.accept_encoding;
+-    if (ae == NULL) {
+-        return NGX_DECLINED;
+-    }
+-
+-    return ngx_http_zstd_accept_encoding(&ae->value);
++    return ngx_http_accepts_coding(r->headers_in.accept_encoding, "zstd",
++                                   sizeof("zstd") - 1);
+ }
+ 
+ 
+--- a/brotli/filter/ngx_http_brotli_filter_module.c
++++ b/brotli/filter/ngx_http_brotli_filter_module.c
+@@ -7,6 +7,7 @@
+ #include <ngx_config.h>
+ #include <ngx_core.h>
+ #include <ngx_http.h>
++#include <ngx_http_zstd_accept_encoding.h>
+ 
+ #if (NGX_HAVE_BROTLI_ENC_ENCODE_H)
+ #include <brotli/enc/encode.h>
+@@ -208,55 +209,8 @@
+ static const size_t kEncodingLen = 2;
+ 
+ static ngx_int_t check_accept_encoding(ngx_http_request_t* req) {
+-  ngx_table_elt_t* accept_encoding_entry;
+-  ngx_str_t* accept_encoding;
+-  u_char* cursor;
+-  u_char* end;
+-  u_char before;
+-  u_char after;
+-
+-  accept_encoding_entry = req->headers_in.accept_encoding;
+-  if (accept_encoding_entry == NULL) return NGX_DECLINED;
+-  accept_encoding = &accept_encoding_entry->value;
+-
+-  if (accept_encoding->len < kEncodingLen) return NGX_DECLINED;
+-
+-  cursor = accept_encoding->data;
+-  end = cursor + accept_encoding->len;
+-  while (1) {
+-    u_char digit;
+-    /* It would be an idiotic idea to rely on compiler to produce performant
+-       binary, that is why we just do -1 at every call site. */
+-    cursor = ngx_strcasestrn(cursor, kEncoding, kEncodingLen - 1);
+-    if (cursor == NULL) return NGX_DECLINED;
+-    before = (cursor == accept_encoding->data) ? ' ' : cursor[-1];
+-    cursor += kEncodingLen;
+-    after = (cursor >= end) ? ' ' : *cursor;
+-    if (before != ',' && before != ' ') continue;
+-    if (after != ',' && after != ' ' && after != ';') continue;
+-
+-    /* Check for ";q=0[.[0[0[0]]]]" */
+-    while (*cursor == ' ') cursor++;
+-    if (*(cursor++) != ';') break;
+-    while (*cursor == ' ') cursor++;
+-    if (*(cursor++) != 'q') break;
+-    while (*cursor == ' ') cursor++;
+-    if (*(cursor++) != '=') break;
+-    while (*cursor == ' ') cursor++;
+-    if (*(cursor++) != '0') break;
+-    if (*(cursor++) != '.') return NGX_DECLINED; /* ;q=0, */
+-    digit = *(cursor++);
+-    if (digit < '0' || digit > '9') return NGX_DECLINED; /* ;q=0., */
+-    if (digit > '0') break;
+-    digit = *(cursor++);
+-    if (digit < '0' || digit > '9') return NGX_DECLINED; /* ;q=0.0, */
+-    if (digit > '0') break;
+-    digit = *(cursor++);
+-    if (digit < '0' || digit > '9') return NGX_DECLINED; /* ;q=0.00, */
+-    if (digit > '0') break;
+-    return NGX_DECLINED; /* ;q=0.000 */
+-  }
+-  return NGX_OK;
++  return ngx_http_accepts_coding(req->headers_in.accept_encoding, kEncoding,
++                                 kEncodingLen);
+ }
+ 
+ /* Process headers and decide if request is eligible for brotli compression. */
+--- a/brotli/static/ngx_http_brotli_static_module.c
++++ b/brotli/static/ngx_http_brotli_static_module.c
+@@ -8,6 +8,7 @@
+ #include <ngx_config.h>
+ #include <ngx_core.h>
+ #include <ngx_http.h>
++#include <ngx_http_zstd_accept_encoding.h>
+ 
+ /* >> Configuration */
+ 
+@@ -83,53 +84,8 @@
+ static const size_t kSuffixLen = 3;
+ 
+ static ngx_int_t check_accept_encoding(ngx_http_request_t* req) {
+-  ngx_table_elt_t* accept_encoding_entry;
+-  ngx_str_t* accept_encoding;
+-  u_char* cursor;
+-  u_char* end;
+-  u_char before;
+-  u_char after;
+-
+-  accept_encoding_entry = req->headers_in.accept_encoding;
+-  if (accept_encoding_entry == NULL) return NGX_DECLINED;
+-  accept_encoding = &accept_encoding_entry->value;
+-
+-  cursor = accept_encoding->data;
+-  end = cursor + accept_encoding->len;
+-  while (1) {
+-    u_char digit;
+-    /* It would be an idiotic idea to rely on compiler to produce performant
+-       binary, that is why we just do -1 at every call site. */
+-    cursor = ngx_strcasestrn(cursor, kEncoding, kEncodingLen - 1);
+-    if (cursor == NULL) return NGX_DECLINED;
+-    before = (cursor == accept_encoding->data) ? ' ' : cursor[-1];
+-    cursor += kEncodingLen;
+-    after = (cursor >= end) ? ' ' : *cursor;
+-    if (before != ',' && before != ' ') continue;
+-    if (after != ',' && after != ' ' && after != ';') continue;
+-
+-    /* Check for ";q=0[.[0[0[0]]]]" */
+-    while (*cursor == ' ') cursor++;
+-    if (*(cursor++) != ';') break;
+-    while (*cursor == ' ') cursor++;
+-    if (*(cursor++) != 'q') break;
+-    while (*cursor == ' ') cursor++;
+-    if (*(cursor++) != '=') break;
+-    while (*cursor == ' ') cursor++;
+-    if (*(cursor++) != '0') break;
+-    if (*(cursor++) != '.') return NGX_DECLINED; /* ;q=0, */
+-    digit = *(cursor++);
+-    if (digit < '0' || digit > '9') return NGX_DECLINED; /* ;q=0., */
+-    if (digit > '0') break;
+-    digit = *(cursor++);
+-    if (digit < '0' || digit > '9') return NGX_DECLINED; /* ;q=0.0, */
+-    if (digit > '0') break;
+-    digit = *(cursor++);
+-    if (digit < '0' || digit > '9') return NGX_DECLINED; /* ;q=0.00, */
+-    if (digit > '0') break;
+-    return NGX_DECLINED; /* ;q=0.000 */
+-  }
+-  return NGX_OK;
++  return ngx_http_accepts_coding(req->headers_in.accept_encoding, kEncoding,
++                                 kEncodingLen);
+ }
+ 
+ /* Test if this request is allowed to have the brotli response. */
+--- a/nginx/src/http/ngx_http_core_module.c
++++ b/nginx/src/http/ngx_http_core_module.c
+@@ -8,6 +8,7 @@
+ #include <ngx_config.h>
+ #include <ngx_core.h>
+ #include <ngx_http.h>
++#include <ngx_http_zstd_accept_encoding.h>
+ 
+ 
+ typedef struct {
+@@ -75,8 +76,6 @@
+ static char *ngx_http_core_resolver(ngx_conf_t *cf, ngx_command_t *cmd,
+     void *conf);
+ #if (NGX_HTTP_GZIP)
+-static ngx_int_t ngx_http_gzip_accept_encoding(ngx_str_t *ae);
+-static ngx_uint_t ngx_http_gzip_quantity(u_char *p, u_char *last);
+ static char *ngx_http_gzip_disable(ngx_conf_t *cf, ngx_command_t *cmd,
+     void *conf);
+ #endif
+@@ -2138,7 +2137,7 @@
+ {
+     time_t                     date, expires;
+     ngx_uint_t                 p;
+-    ngx_table_elt_t           *e, *d, *ae, *cc;
++    ngx_table_elt_t           *e, *d, *cc;
+     ngx_http_core_loc_conf_t  *clcf;
+ 
+     r->gzip_tested = 1;
+@@ -2147,26 +2146,8 @@
+         return NGX_DECLINED;
+     }
+ 
+-    ae = r->headers_in.accept_encoding;
+-    if (ae == NULL) {
+-        return NGX_DECLINED;
+-    }
+-
+-    if (ae->value.len < sizeof("gzip") - 1) {
+-        return NGX_DECLINED;
+-    }
+-
+-    /*
+-     * test first for the most common case "gzip,...":
+-     *   MSIE:    "gzip, deflate"
+-     *   Firefox: "gzip,deflate"
+-     *   Chrome:  "gzip,deflate,sdch"
+-     *   Safari:  "gzip, deflate"
+-     *   Opera:   "gzip, deflate"
+-     */
+-
+-    if (ngx_memcmp(ae->value.data, "gzip,", 5) != 0
+-        && ngx_http_gzip_accept_encoding(&ae->value) != NGX_OK)
++    if (ngx_http_accepts_coding(r->headers_in.accept_encoding, "gzip",
++                                sizeof("gzip") - 1) != NGX_OK)
+     {
+         return NGX_DECLINED;
+     }
+@@ -2299,127 +2280,6 @@
+  * gzip is disabled for the following quantities:
+  *     "gzip; q=0" ... "gzip; q=0.000", and for any invalid cases
+  */
+-
+-static ngx_int_t
+-ngx_http_gzip_accept_encoding(ngx_str_t *ae)
+-{
+-    u_char  *p, *start, *last;
+-
+-    start = ae->data;
+-    last = start + ae->len;
+-
+-    for ( ;; ) {
+-        p = ngx_strcasestrn(start, "gzip", 4 - 1);
+-        if (p == NULL) {
+-            return NGX_DECLINED;
+-        }
+-
+-        if (p == start || (*(p - 1) == ',' || *(p - 1) == ' ')) {
+-            break;
+-        }
+-
+-        start = p + 4;
+-    }
+-
+-    p += 4;
+-
+-    while (p < last) {
+-        switch (*p++) {
+-        case ',':
+-            return NGX_OK;
+-        case ';':
+-            goto quantity;
+-        case ' ':
+-            continue;
+-        default:
+-            return NGX_DECLINED;
+-        }
+-    }
+-
+-    return NGX_OK;
+-
+-quantity:
+-
+-    while (p < last) {
+-        switch (*p++) {
+-        case 'q':
+-        case 'Q':
+-            goto equal;
+-        case ' ':
+-            continue;
+-        default:
+-            return NGX_DECLINED;
+-        }
+-    }
+-
+-    return NGX_OK;
+-
+-equal:
+-
+-    if (p + 2 > last || *p++ != '=') {
+-        return NGX_DECLINED;
+-    }
+-
+-    if (ngx_http_gzip_quantity(p, last) == 0) {
+-        return NGX_DECLINED;
+-    }
+-
+-    return NGX_OK;
+-}
+-
+-
+-static ngx_uint_t
+-ngx_http_gzip_quantity(u_char *p, u_char *last)
+-{
+-    u_char      c;
+-    ngx_uint_t  n, q;
+-
+-    c = *p++;
+-
+-    if (c != '0' && c != '1') {
+-        return 0;
+-    }
+-
+-    q = (c - '0') * 100;
+-
+-    if (p == last) {
+-        return q;
+-    }
+-
+-    c = *p++;
+-
+-    if (c == ',' || c == ' ') {
+-        return q;
+-    }
+-
+-    if (c != '.') {
+-        return 0;
+-    }
+-
+-    n = 0;
+-
+-    while (p < last) {
+-        c = *p++;
+-
+-        if (c == ',' || c == ' ') {
+-            break;
+-        }
+-
+-        if (c >= '0' && c <= '9') {
+-            q += c - '0';
+-            n++;
+-            continue;
+-        }
+-
+-        return 0;
+-    }
+-
+-    if (q > 100 || n > 3) {
+-        return 0;
+-    }
+-
+-    return q;
+-}
+ 
+ #endif
+ 

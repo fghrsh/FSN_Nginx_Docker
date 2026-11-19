@@ -4,8 +4,8 @@ VeryNginx Docker / FGHRSH Service Node Infrastructure
 ### 特性
 
 - 启用 Strict-SNI<sup>1</sup>，保护源站 IP 不被 SSL 暴露
-- 基于 Nginx 1.17.7 编译，集成 VeryNginx 脚本
-- 支持 HTTP 2 / TLS 1.3 / Brotli / Headers More 等
+- 基于 Nginx 1.31.9 编译，集成 VeryNginx 脚本
+- 支持 HTTP/2、HTTP/3、Brotli、Zstd、Headers More 等
 
 > <sup>1</sup> 如遇 CDN 回源 503 错误，请修改 `nginx.conf`: `strict_sni off;`
 　

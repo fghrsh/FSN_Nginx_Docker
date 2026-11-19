@@ -1,0 +1,147 @@
+Port the legacy strict_sni and strict_sni_header directives from hakasenyang/openssl-patch.
+Use the selected TLS vhost for dynamic record sizing as well as its buffer size.
+
+--- a/src/http/ngx_http_core_module.h
++++ b/src/http/ngx_http_core_module.h
+@@ -164,6 +164,9 @@
+     ngx_array_t                variables;         /* ngx_http_variable_t */
+     ngx_array_t                prefix_variables;  /* ngx_http_variable_t */
+     ngx_uint_t                 ncaptures;
++
++    ngx_flag_t                 strict_sni;
++    ngx_flag_t                 strict_sni_header;
+ 
+     ngx_uint_t                 server_names_hash_max_size;
+     ngx_uint_t                 server_names_hash_bucket_size;
+--- a/src/http/ngx_http_core_module.c
++++ b/src/http/ngx_http_core_module.c
+@@ -196,6 +196,20 @@
+       offsetof(ngx_http_core_main_conf_t, variables_hash_bucket_size),
+       NULL },
+ 
++    { ngx_string("strict_sni"),
++      NGX_HTTP_MAIN_CONF|NGX_CONF_FLAG,
++      ngx_conf_set_flag_slot,
++      NGX_HTTP_MAIN_CONF_OFFSET,
++      offsetof(ngx_http_core_main_conf_t, strict_sni),
++      NULL },
++
++    { ngx_string("strict_sni_header"),
++      NGX_HTTP_MAIN_CONF|NGX_CONF_FLAG,
++      ngx_conf_set_flag_slot,
++      NGX_HTTP_MAIN_CONF_OFFSET,
++      offsetof(ngx_http_core_main_conf_t, strict_sni_header),
++      NULL },
++
+     { ngx_string("server_names_hash_max_size"),
+       NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE1,
+       ngx_conf_set_num_slot,
+@@ -3531,6 +3545,8 @@
+         return NULL;
+     }
+ 
++    cmcf->strict_sni = NGX_CONF_UNSET;
++    cmcf->strict_sni_header = NGX_CONF_UNSET;
+     cmcf->server_names_hash_max_size = NGX_CONF_UNSET_UINT;
+     cmcf->server_names_hash_bucket_size = NGX_CONF_UNSET_UINT;
+ 
+@@ -3546,6 +3562,8 @@
+ {
+     ngx_http_core_main_conf_t *cmcf = conf;
+ 
++    ngx_conf_init_value(cmcf->strict_sni, 0);
++    ngx_conf_init_value(cmcf->strict_sni_header, 0);
+     ngx_conf_init_uint_value(cmcf->server_names_hash_max_size, 512);
+     ngx_conf_init_uint_value(cmcf->server_names_hash_bucket_size,
+                              ngx_cacheline_size);
+--- a/src/http/ngx_http_request.c
++++ b/src/http/ngx_http_request.c
+@@ -886,7 +886,8 @@
+ ngx_http_ssl_servername(ngx_ssl_conn_t *ssl_conn, int *ad, void *arg)
+ {
+     ngx_int_t                  rc;
+-    ngx_str_t                  host;
++    ngx_str_t                  host = ngx_null_string;
++    ngx_http_core_main_conf_t  *cmcf;
+     const char                *servername;
+     ngx_connection_t          *c;
+     ngx_http_connection_t     *hc;
+@@ -978,6 +979,7 @@
+     sscf = ngx_http_get_module_srv_conf(cscf->ctx, ngx_http_ssl_module);
+ 
+     c->ssl->buffer_size = sscf->buffer_size;
++    c->ssl->dyn_rec = sscf->ssl.dyn_rec;
+ 
+     if (sscf->ssl.ctx) {
+         if (SSL_set_SSL_CTX(ssl_conn, sscf->ssl.ctx) == NULL) {
+@@ -1019,7 +1021,13 @@
+ 
+     sscf = ngx_http_get_module_srv_conf(hc->conf_ctx, ngx_http_ssl_module);
+ 
+-    if (sscf->reject_handshake) {
++    cmcf = ngx_http_get_module_main_conf(hc->conf_ctx, ngx_http_core_module);
++
++    if (sscf->reject_handshake
++        || (cmcf->strict_sni && hc->ssl_servername == NULL
++            && (host.len == 0 || hc->addr_conf->quic
++                || hc->addr_conf->virtual_names != NULL)))
++    {
+         c->ssl->handshake_rejected = 1;
+         *ad = SSL_AD_UNRECOGNIZED_NAME;
+         return SSL_TLSEXT_ERR_ALERT_FATAL;
+@@ -1111,6 +1119,20 @@
+ #endif
+ 
+ 
++static ngx_uint_t
++ngx_http_strict_sni_header(ngx_http_request_t *r)
++{
++#if (NGX_HTTP_SSL)
++    ngx_http_core_main_conf_t  *cmcf;
++
++    cmcf = ngx_http_get_module_main_conf(r, ngx_http_core_module);
++    return r->http_connection->ssl && cmcf->strict_sni && cmcf->strict_sni_header;
++#else
++    return 0;
++#endif
++}
++
++
+ static void
+ ngx_http_process_request_line(ngx_event_t *rev)
+ {
+@@ -1239,7 +1261,10 @@
+             ngx_log_error(NGX_LOG_INFO, c->log, 0,
+                           ngx_http_client_errors[rc - NGX_HTTP_CLIENT_ERROR]);
+ 
+-            if (rc == NGX_HTTP_PARSE_INVALID_VERSION) {
++            if (ngx_http_strict_sni_header(r)) {
++                ngx_http_terminate_request(r, 0);
++
++            } else if (rc == NGX_HTTP_PARSE_INVALID_VERSION) {
+                 ngx_http_finalize_request(r, NGX_HTTP_VERSION_NOT_SUPPORTED);
+ 
+             } else {
+@@ -2035,7 +2060,11 @@
+     if (r->headers_in.host == NULL && r->http_version > NGX_HTTP_VERSION_10) {
+         ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
+                    "client sent HTTP/1.1 request without \"Host\" header");
+-        ngx_http_finalize_request(r, NGX_HTTP_BAD_REQUEST);
++        if (ngx_http_strict_sni_header(r)) {
++            ngx_http_terminate_request(r, 0);
++        } else {
++            ngx_http_finalize_request(r, NGX_HTTP_BAD_REQUEST);
++        }
+         return NGX_ERROR;
+     }
+ 
+--- a/src/http/ngx_http.c
++++ b/src/http/ngx_http.c
+@@ -1570,6 +1570,7 @@
+         for (a = 0; a < port[p].addrs.nelts; a++) {
+ 
+             if (addr[a].servers.nelts > 1
++                || (addr[a].opt.quic && cmcf->strict_sni)
+ #if (NGX_PCRE)
+                 || addr[a].default_server->captures
+ #endif
